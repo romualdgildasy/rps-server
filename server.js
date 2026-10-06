@@ -1,4 +1,3 @@
-
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -6,6 +5,11 @@ import cors from "cors";
 
 const app = express();
 app.use(cors());
+
+// 1. Route de vérification pour Render (Health Check)
+app.get("/", (req, res) => {
+    res.send("🚀 Serveur Pierre Papier Ciseaux en ligne !");
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -23,11 +27,14 @@ io.on("connection", (socket) => {
             rooms[roomId] = {
                 players: [],
                 choices: {},
-                scores: {} // Stocke { socketId: points }
+                scores: {}
             };
         }
 
         const room = rooms[roomId];
+
+        // Sécurité : éviter qu'un même joueur rejoigne 2 fois si sa connexion mobile saute
+        if (room.players.some(p => p.id === socket.id)) return;
 
         if (room.players.length >= 2) {
             socket.emit("roomFull");
@@ -35,7 +42,7 @@ io.on("connection", (socket) => {
         }
 
         room.players.push({ id: socket.id, pseudo });
-        room.scores[socket.id] = 0; // Démarre à 0 point
+        room.scores[socket.id] = 0;
         socket.join(roomId);
 
         if (room.players.length === 1) {
@@ -53,7 +60,7 @@ io.on("connection", (socket) => {
     // Choix d'un joueur
     socket.on("makeChoice", ({ roomId, choice }) => {
         const room = rooms[roomId];
-        if (!room) return;
+        if (!room || room.players.length < 2) return;
 
         room.choices[socket.id] = choice;
         socket.to(roomId).emit("opponentMadeChoice");
@@ -73,17 +80,16 @@ io.on("connection", (socket) => {
                 (c1 === "paper" && c2 === "rock")
             ) {
                 resultP1 = "win";
-                room.scores[p1.id]++; // +1 point pour P1
+                room.scores[p1.id]++;
             } else {
                 resultP1 = "lose";
-                room.scores[p2.id]++; // +1 point pour P2
+                room.scores[p2.id]++;
             }
 
             const p1Score = room.scores[p1.id];
             const p2Score = room.scores[p2.id];
             const isGameOver = p1Score >= 3 || p2Score >= 3;
 
-            // Envoi des résultats de la manche
             io.to(p1.id).emit("roundResult", {
                 yourChoice: c1,
                 oppChoice: c2,
@@ -102,14 +108,13 @@ io.on("connection", (socket) => {
                 isGameOver
             });
 
-            // Si quelqu'un a atteint 3 points -> Fin du match
             if (isGameOver) {
                 const winnerId = p1Score >= 3 ? p1.id : p2.id;
                 io.to(p1.id).emit("matchEnd", { won: p1.id === winnerId });
                 io.to(p2.id).emit("matchEnd", { won: p2.id === winnerId });
-                delete rooms[roomId]; // On nettoie le salon
+                delete rooms[roomId];
             } else {
-                room.choices = {}; // Prêt pour la manche suivante
+                room.choices = {};
             }
         }
     });
