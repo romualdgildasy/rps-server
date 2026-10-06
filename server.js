@@ -17,31 +17,72 @@ const io = new Server(server, {
 });
 
 const rooms = {};
+const AWAY_DELAY = 5 * 60 * 1000; // 5 minutes pour revenir pendant un match
+
+function startMatch(room) {
+    room.started = true;
+    const [p1, p2] = room.players;
+    io.to(p1.id).emit("gameStart", { opponentPseudo: p2.pseudo });
+    io.to(p2.id).emit("gameStart", { opponentPseudo: p1.pseudo });
+}
 
 io.on("connection", (socket) => {
     console.log(`Connecté : ${socket.id}`);
 
     // Rejoindre un salon
-    socket.on("joinRoom", ({ roomId, pseudo }) => {
+    socket.on("joinRoom", ({ roomId, pseudo, playerId }) => {
+        console.log(`JOIN ${pseudo} -> salle ${roomId} (${socket.id})`);
+
         if (!rooms[roomId]) {
             rooms[roomId] = {
                 players: [],
                 choices: {},
-                scores: {}
+                scores: {},
+                started: false
             };
         }
 
         const room = rooms[roomId];
 
-        // Sécurité : éviter qu'un même joueur rejoigne 2 fois si sa connexion mobile saute
+        // Sécurité : même socket qui rejoint 2 fois
         if (room.players.some(p => p.id === socket.id)) return;
+
+        // Reconnexion du même joueur (nouveau socket.id après une mise en veille)
+        const existing = playerId && room.players.find(p => p.playerId === playerId);
+        if (existing) {
+            room.scores[socket.id] = room.scores[existing.id] ?? 0;
+            delete room.scores[existing.id];
+            if (room.choices[existing.id]) {
+                room.choices[socket.id] = room.choices[existing.id];
+                delete room.choices[existing.id];
+            }
+            existing.id = socket.id;
+            existing.pseudo = pseudo;
+            socket.join(roomId);
+
+            if (room.players.length === 2) {
+                if (!room.started) {
+                    startMatch(room);
+                } else {
+                    // Match déjà lancé : on renvoie l'état au joueur revenu
+                    const other = room.players.find(p => p.id !== socket.id);
+                    socket.emit("resync", {
+                        opponentPseudo: other.pseudo,
+                        yourScore: room.scores[socket.id],
+                        oppScore: room.scores[other.id]
+                    });
+                    socket.to(roomId).emit("opponentBack");
+                }
+            }
+            return;
+        }
 
         if (room.players.length >= 2) {
             socket.emit("roomFull");
             return;
         }
 
-        room.players.push({ id: socket.id, pseudo });
+        room.players.push({ id: socket.id, pseudo, playerId });
         room.scores[socket.id] = 0;
         socket.join(roomId);
 
@@ -51,9 +92,7 @@ io.on("connection", (socket) => {
 
         // Dès que les 2 sont là, on lance le match
         if (room.players.length === 2) {
-            const [p1, p2] = room.players;
-            io.to(p1.id).emit("gameStart", { opponentPseudo: p2.pseudo });
-            io.to(p2.id).emit("gameStart", { opponentPseudo: p1.pseudo });
+            startMatch(room);
         }
     });
 
@@ -119,15 +158,35 @@ io.on("connection", (socket) => {
         }
     });
 
-    socket.on("disconnect", () => {
+    socket.on("disconnect", (reason) => {
+        console.log(`DISCONNECT ${socket.id} : ${reason}`);
+
         for (const roomId in rooms) {
             const room = rooms[roomId];
             const index = room.players.findIndex(p => p.id === socket.id);
-            if (index !== -1) {
-                socket.to(roomId).emit("opponentLeft");
-                delete rooms[roomId];
-                break;
+            if (index === -1) continue; // ancien socket déjà remplacé : on ignore
+
+            if (!room.started) {
+                // Salle d'attente : on retire juste ce joueur, la salle survit
+                room.players.splice(index, 1);
+                delete room.scores[socket.id];
+                delete room.choices[socket.id];
+                if (room.players.length === 0) delete rooms[roomId];
+            } else {
+                // Match en cours : on prévient l'autre joueur, puis on attend le retour
+                const lostId = socket.id;
+                socket.to(roomId).emit("opponentAway");
+                setTimeout(() => {
+                    const r = rooms[roomId];
+                    if (!r) return;
+                    const stillGone = r.players.some(p => p.id === lostId);
+                    if (stillGone) {
+                        io.to(roomId).emit("opponentLeft");
+                        delete rooms[roomId];
+                    }
+                }, AWAY_DELAY);
             }
+            break;
         }
     });
 });
